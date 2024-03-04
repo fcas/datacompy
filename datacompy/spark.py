@@ -13,13 +13,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
+"""
+Compare two Spark DataFrames
+
+Originally this package was meant to provide similar functionality to
+PROC COMPARE in SAS - i.e. human-readable reporting on the difference between
+two dataframes.
+"""
+
+import logging
+import os
 from enum import Enum
-from itertools import chain
-from typing import Any, Dict, List, Optional, Set, TextIO, Tuple, Union
+
+import pandas as pd
+import pyspark.sql
+from ordered_set import OrderedSet
+from pyspark.sql.functions import (
+    abs,
+    array,
+    array_contains,
+    coalesce,
+    col,
+    isnan,
+    isnull,
+    lit,
+    trim,
+    upper,
+    when,
+)
+
+from datacompy.base import BaseCompare
+
+LOG = logging.getLogger(__name__)
+
 
 try:
-    import pyspark
     from pyspark.sql import functions as F
 except ImportError:
     pass  # Let non-Spark people at least enjoy the loveliness of the pandas datacompy functionality
@@ -30,9 +58,9 @@ class MatchType(Enum):
 
 
 # Used for checking equality with decimal(X, Y) types. Otherwise treated as the string "decimal".
-def decimal_comparator() -> str:
+def decimal_comparator():
     class DecimalComparator(str):
-        def __eq__(self, other: str) -> bool:  # type: ignore[override]
+        def __eq__(self, other):
             return len(other) >= 7 and other[0:7] == "decimal"
 
     return DecimalComparator("decimal")
@@ -49,8 +77,9 @@ NUMERIC_SPARK_TYPES = [
 ]
 
 
-def _is_comparable(type1: str, type2: str) -> bool:
+def _is_comparable(type1, type2):
     """Checks if two Spark data types can be safely compared.
+
     Two data types are considered comparable if any of the following apply:
         1. Both data types are the same
         2. Both data types are numeric
@@ -67,825 +96,927 @@ def _is_comparable(type1: str, type2: str) -> bool:
     bool
         True if both data types are comparable
     """
-
     return type1 == type2 or (
         type1 in NUMERIC_SPARK_TYPES and type2 in NUMERIC_SPARK_TYPES
     )
 
 
-class SparkCompare:
-    """Comparison class used to compare two Spark Dataframes.
+class SparkCompare(BaseCompare):
+    """Comparison class to be used to compare whether two Spark dataframes as equal.
 
-    Extends the ``Compare`` functionality to the wide world of Spark and
-    out-of-memory data.
+    Both df1 and df2 should be dataframes containing all of the join_columns,
+    with unique column names. Differences between values are compared to
+    abs_tol + rel_tol * abs(df2['value']).
 
     Parameters
     ----------
-    spark_session : ``pyspark.sql.SparkSession``
-        A ``SparkSession`` to be used to execute Spark commands in the
-        comparison.
-    base_df : ``pyspark.sql.DataFrame``
-        The dataframe to serve as a basis for comparison. While you will
-        ultimately get the same results comparing A to B as you will comparing
-        B to A, by convention ``base_df`` should be the canonical, gold
-        standard reference dataframe in the comparison.
-    compare_df : ``pyspark.sql.DataFrame``
-        The dataframe to be compared against ``base_df``.
-    join_columns : list
-        A list of columns comprising the join key(s) of the two dataframes.
-        If the column names are the same in the two dataframes, the names of
-        the columns can be given as strings. If the names differ, the
-        ``join_columns`` list should include tuples of the form
-        (base_column_name, compare_column_name).
-    column_mapping : list[tuple], optional
-        If columns to be compared have different names in the base and compare
-        dataframes, a list should be provided in ``columns_mapping`` consisting
-        of tuples of the form (base_column_name, compare_column_name) for each
-        set of differently-named columns to be compared against each other.
-    cache_intermediates : bool, optional
-        Whether or not ``SparkCompare`` will cache intermediate dataframes
-        (such as the deduplicated version of dataframes, or the joined
-        comparison). This will take a large amount of cache, proportional to
-        the size of your dataframes, but will significantly speed up
-        performance, as multiple steps will not have to recompute
-        transformations. False by default.
-    known_differences : list[dict], optional
-        A list of dictionaries that define transformations to apply to the
-        compare dataframe to match values when there are known differences
-        between base and compare. The dictionaries should contain:
-
-            * name: A name that describes the transformation
-            * types: The types that the transformation should be applied to.
-                This prevents certain transformations from being applied to
-                types that don't make sense and would cause exceptions.
-            * transformation: A Spark SQL statement to apply to the column
-                in the compare dataset. The string "{input}" will be replaced
-                by the variable in question.
+    spark_session : pyspark.sql.SparkSession
+        A ``SparkSession`` to be used to execute Spark commands in the comparison.
+    df1 : pyspark.sql.DataFrame
+        First dataframe to check
+    df2 : pyspark.sql.DataFrame
+        Second dataframe to check
+    join_columns : list or str
+        Column(s) to join dataframes on.  If a string is passed in, that one
+        column will be used.
     abs_tol : float, optional
         Absolute tolerance between two values.
     rel_tol : float, optional
         Relative tolerance between two values.
-    show_all_columns : bool, optional
-        If true, all columns will be shown in the report including columns
-        with a 100% match rate.
-    match_rates : bool, optional
-        If true, match rates by column will be shown in the column summary.
+    df1_name : str, optional
+        A string name for the first dataframe. This allows the reporting to
+        print out an actual name instead of "df1", and allows human users to
+        more easily track the dataframes.
+    df2_name : str, optional
+        A string name for the second dataframe. This allows the reporting to
+        print out an actual name instead of "df2", and allows human users to
+        more easily track the dataframes.
+    ignore_spaces : bool, optional
+        Flag to strip whitespace (including newlines) from string columns (including any join
+        columns)
+    ignore_case : bool, optional
+        Flag to ignore the case of string columns
 
-    Returns
-    -------
-    SparkCompare
-        Instance of a ``SparkCompare`` object, ready to do some comparin'.
-        Note that if ``cache_intermediates=True``, this instance will already
-        have done some work deduping the input dataframes. If
-        ``cache_intermediates=False``, the instantiation of this object is lazy.
+    Attributes
+    ----------
+    spark_session : pyspark.sql.SparkSession
+        A ``SparkSession`` to be used to execute Spark commands in the comparison.
+    df1_unq_rows : pyspark.sql.DataFrame
+        All records that are only in df1 (based on a join on join_columns)
+    df2_unq_rows : pyspark.sql.DataFrame
+        All records that are only in df2 (based on a join on join_columns)
     """
 
     def __init__(
         self,
-        spark_session: "pyspark.sql.SparkSession",
-        base_df: "pyspark.sql.DataFrame",
-        compare_df: "pyspark.sql.DataFrame",
-        join_columns: List[Union[str, Tuple[str, str]]],
-        column_mapping: Optional[List[Tuple[str, str]]] = None,
-        cache_intermediates: bool = False,
-        known_differences: Optional[List[Dict[str, Any]]] = None,
-        rel_tol: float = 0,
-        abs_tol: float = 0,
-        show_all_columns: bool = False,
-        match_rates: bool = False,
+        spark_session,
+        df1,
+        df2,
+        join_columns=None,
+        abs_tol=0,
+        rel_tol=0,
+        df1_name="df1",
+        df2_name="df2",
+        ignore_spaces=False,
+        ignore_case=False,
     ):
-        self.rel_tol = rel_tol
-        self.abs_tol = abs_tol
-        if self.rel_tol < 0 or self.abs_tol < 0:
-            raise ValueError("Please enter positive valued tolerances")
-        self.show_all_columns = show_all_columns
-        self.match_rates = match_rates
-
-        self._original_base_df = base_df
-        self._original_compare_df = compare_df
-        self.cache_intermediates = cache_intermediates
-
-        self.join_columns = self._tuplizer(input_list=join_columns)
-        self._join_column_names = [name[0] for name in self.join_columns]
-
-        self._known_differences = known_differences
-
-        if column_mapping:
-            for mapping in column_mapping:
-                compare_df = compare_df.withColumnRenamed(mapping[1], mapping[0])
-            self.column_mapping = dict(column_mapping)
-        else:
-            self.column_mapping = {}
-
-        for mapping in self.join_columns:
-            if mapping[1] != mapping[0]:
-                compare_df = compare_df.withColumnRenamed(mapping[1], mapping[0])
+        if not isinstance(df1, pyspark.sql.DataFrame):
+            raise TypeError("df1 must be a Spark DataFrame")
+        if not isinstance(df2, pyspark.sql.DataFrame):
+            raise TypeError("df2 must be a Spark DataFrame")
 
         self.spark = spark_session
-        self.base_unq_rows = self.compare_unq_rows = None
-        self._base_row_count: Optional[int] = None
-        self._compare_row_count: Optional[int] = None
-        self._common_row_count: Optional[int] = None
-        self._joined_dataframe: Optional["pyspark.sql.DataFrame"] = None
-        self._rows_only_base: Optional["pyspark.sql.DataFrame"] = None
-        self._rows_only_compare: Optional["pyspark.sql.DataFrame"] = None
-        self._all_matched_rows: Optional["pyspark.sql.DataFrame"] = None
-        self._all_rows_mismatched: Optional["pyspark.sql.DataFrame"] = None
-        self.columns_match_dict: Dict[str, Any] = {}
+        self._any_dupes = False
 
-        # drop the duplicates before actual comparison made.
-        self.base_df = base_df.dropDuplicates(self._join_column_names)
-        self.compare_df = compare_df.dropDuplicates(self._join_column_names)
-
-        if cache_intermediates:
-            self.base_df.cache()
-            self._base_row_count = self.base_df.count()
-            self.compare_df.cache()
-            self._compare_row_count = self.compare_df.count()
-
-    def _tuplizer(
-        self, input_list: List[Union[str, Tuple[str, str]]]
-    ) -> List[Tuple[str, str]]:
-        join_columns: List[Tuple[str, str]] = []
-        for val in input_list:
-            if isinstance(val, str):
-                join_columns.append((val, val))
-            else:
-                join_columns.append(val)
-
-        return join_columns
-
-    @property
-    def columns_in_both(self) -> Set[str]:
-        """set[str]: Get columns in both dataframes"""
-        return set(self.base_df.columns) & set(self.compare_df.columns)
-
-    @property
-    def columns_compared(self) -> List[str]:
-        """list[str]: Get columns to be compared in both dataframes (all
-        columns in both excluding the join key(s)"""
-        return [
-            column
-            for column in list(self.columns_in_both)
-            if column not in self._join_column_names
-        ]
-
-    @property
-    def columns_only_base(self) -> Set[str]:
-        """set[str]: Get columns that are unique to the base dataframe"""
-        return set(self.base_df.columns) - set(self.compare_df.columns)
-
-    @property
-    def columns_only_compare(self) -> Set[str]:
-        """set[str]: Get columns that are unique to the compare dataframe"""
-        return set(self.compare_df.columns) - set(self.base_df.columns)
-
-    @property
-    def base_row_count(self) -> int:
-        """int: Get the count of rows in the de-duped base dataframe"""
-        if self._base_row_count is None:
-            self._base_row_count = self.base_df.count()
-
-        return self._base_row_count
-
-    @property
-    def compare_row_count(self) -> int:
-        """int: Get the count of rows in the de-duped compare dataframe"""
-        if self._compare_row_count is None:
-            self._compare_row_count = self.compare_df.count()
-
-        return self._compare_row_count
-
-    @property
-    def common_row_count(self) -> int:
-        """int: Get the count of rows in common between base and compare dataframes"""
-        if self._common_row_count is None:
-            common_rows = self._get_or_create_joined_dataframe()
-            self._common_row_count = common_rows.count()
-
-        return self._common_row_count
-
-    def _get_unq_base_rows(self) -> "pyspark.sql.DataFrame":
-        """Get the rows only from base data frame"""
-        return self.base_df.select(self._join_column_names).subtract(
-            self.compare_df.select(self._join_column_names)
-        )
-
-    def _get_compare_rows(self) -> "pyspark.sql.DataFrame":
-        """Get the rows only from compare data frame"""
-        return self.compare_df.select(self._join_column_names).subtract(
-            self.base_df.select(self._join_column_names)
-        )
-
-    def _print_columns_summary(self, myfile: TextIO) -> None:
-        """Prints the column summary details"""
-        print("\n****** Column Summary ******", file=myfile)
-        print(
-            f"Number of columns in common with matching schemas: {len(self._columns_with_matching_schema())}",
-            file=myfile,
-        )
-        print(
-            f"Number of columns in common with schema differences: {len(self._columns_with_schemadiff())}",
-            file=myfile,
-        )
-        print(
-            f"Number of columns in base but not compare: {len(self.columns_only_base)}",
-            file=myfile,
-        )
-        print(
-            f"Number of columns in compare but not base: {len(self.columns_only_compare)}",
-            file=myfile,
-        )
-
-    def _print_only_columns(self, base_or_compare: str, myfile: TextIO) -> None:
-        """Prints the columns and data types only in either the base or compare datasets"""
-
-        if base_or_compare.upper() == "BASE":
-            columns = self.columns_only_base
-            df = self.base_df
-        elif base_or_compare.upper() == "COMPARE":
-            columns = self.columns_only_compare
-            df = self.compare_df
+        if join_columns is None:
+            raise Exception("Please provide join_columns")
+        elif isinstance(join_columns, (str, int, float)):
+            self.join_columns = [str(join_columns).lower()]
         else:
-            raise ValueError(
-                f'base_or_compare must be BASE or COMPARE, but was "{base_or_compare}"'
-            )
-
-        # If there are no columns only in this dataframe, don't display this section
-        if not columns:
-            return
-
-        max_length = max([len(col) for col in columns] + [11])
-        format_pattern = f"{{:{max_length}s}}"
-
-        print(f"\n****** Columns In {base_or_compare.title()} Only ******", file=myfile)
-        print((format_pattern + "  Dtype").format("Column Name"), file=myfile)
-        print("-" * max_length + "  -------------", file=myfile)
-
-        for column in columns:
-            col_type = df.select(column).dtypes[0][1]
-            print((format_pattern + "  {:13s}").format(column, col_type), file=myfile)
-
-    def _columns_with_matching_schema(self) -> Dict[str, str]:
-        """This function will identify the columns which has matching schema"""
-        col_schema_match = {}
-        base_columns_dict = dict(self.base_df.dtypes)
-        compare_columns_dict = dict(self.compare_df.dtypes)
-
-        for base_row, base_type in base_columns_dict.items():
-            if base_row in compare_columns_dict:
-                compare_column_type = compare_columns_dict.get(base_row)
-                if compare_column_type is not None and base_type in compare_column_type:
-                    col_schema_match[base_row] = compare_column_type
-
-        return col_schema_match
-
-    def _columns_with_schemadiff(self) -> Dict[str, Dict[str, str]]:
-        """This function will identify the columns which has different schema"""
-        col_schema_diff = {}
-        base_columns_dict = dict(self.base_df.dtypes)
-        compare_columns_dict = dict(self.compare_df.dtypes)
-
-        for base_row, base_type in base_columns_dict.items():
-            if base_row in compare_columns_dict:
-                compare_column_type = compare_columns_dict.get(base_row)
-                if (
-                    compare_column_type is not None
-                    and base_type not in compare_column_type
-                ):
-                    col_schema_diff[base_row] = dict(
-                        base_type=base_type,
-                        compare_type=compare_column_type,
-                    )
-        return col_schema_diff
-
-    @property
-    def rows_both_mismatch(self) -> Optional["pyspark.sql.DataFrame"]:
-        """pyspark.sql.DataFrame: Returns all rows in both dataframes that have mismatches"""
-        if self._all_rows_mismatched is None:
-            self._merge_dataframes()
-
-        return self._all_rows_mismatched
-
-    @property
-    def rows_both_all(self) -> Optional["pyspark.sql.DataFrame"]:
-        """pyspark.sql.DataFrame: Returns all rows in both dataframes"""
-        if self._all_matched_rows is None:
-            self._merge_dataframes()
-
-        return self._all_matched_rows
-
-    @property
-    def rows_only_base(self) -> "pyspark.sql.DataFrame":
-        """pyspark.sql.DataFrame: Returns rows only in the base dataframe"""
-        if not self._rows_only_base:
-            base_rows = self._get_unq_base_rows()
-            base_rows.createOrReplaceTempView("baseRows")
-            self.base_df.createOrReplaceTempView("baseTable")
-            join_condition = " AND ".join(
-                ["A." + name + "<=>B." + name for name in self._join_column_names]
-            )
-            sql_query = "select A.* from baseTable as A, baseRows as B where {}".format(
-                join_condition
-            )
-            self._rows_only_base = self.spark.sql(sql_query)
-
-            if self.cache_intermediates:
-                self._rows_only_base.cache().count()
-
-        return self._rows_only_base
-
-    @property
-    def rows_only_compare(self) -> Optional["pyspark.sql.DataFrame"]:
-        """pyspark.sql.DataFrame: Returns rows only in the compare dataframe"""
-        if not self._rows_only_compare:
-            compare_rows = self._get_compare_rows()
-            compare_rows.createOrReplaceTempView("compareRows")
-            self.compare_df.createOrReplaceTempView("compareTable")
-            where_condition = " AND ".join(
-                ["A." + name + "<=>B." + name for name in self._join_column_names]
-            )
-            sql_query = (
-                "select A.* from compareTable as A, compareRows as B where {}".format(
-                    where_condition
-                )
-            )
-            self._rows_only_compare = self.spark.sql(sql_query)
-
-            if self.cache_intermediates:
-                self._rows_only_compare.cache().count()
-
-        return self._rows_only_compare
-
-    def _generate_select_statement(self, match_data: bool = True) -> str:
-        """This function is to generate the select statement to be used later in the query."""
-        base_only = list(set(self.base_df.columns) - set(self.compare_df.columns))
-        compare_only = list(set(self.compare_df.columns) - set(self.base_df.columns))
-        sorted_list = sorted(list(chain(base_only, compare_only, self.columns_in_both)))
-        select_statement = ""
-
-        for column_name in sorted_list:
-            if column_name in self.columns_compared:
-                if match_data:
-                    select_statement = select_statement + ",".join(
-                        [self._create_case_statement(name=column_name)]
-                    )
-                else:
-                    select_statement = select_statement + ",".join(
-                        [self._create_select_statement(name=column_name)]
-                    )
-            elif column_name in base_only:
-                select_statement = select_statement + ",".join(["A." + column_name])
-
-            elif column_name in compare_only:
-                if match_data:
-                    select_statement = select_statement + ",".join(["B." + column_name])
-                else:
-                    select_statement = select_statement + ",".join(["A." + column_name])
-            elif column_name in self._join_column_names:
-                select_statement = select_statement + ",".join(["A." + column_name])
-
-            if column_name != sorted_list[-1]:
-                select_statement = select_statement + " , "
-
-        return select_statement
-
-    def _merge_dataframes(self) -> None:
-        """Merges the two dataframes and creates self._all_matched_rows and self._all_rows_mismatched."""
-        full_joined_dataframe = self._get_or_create_joined_dataframe()
-        full_joined_dataframe.createOrReplaceTempView("full_matched_table")
-
-        select_statement = self._generate_select_statement(False)
-        select_query = """SELECT {} FROM full_matched_table A""".format(
-            select_statement
-        )
-        self._all_matched_rows = self.spark.sql(select_query).orderBy(
-            self._join_column_names  # type: ignore[arg-type]
-        )
-        self._all_matched_rows.createOrReplaceTempView("matched_table")
-
-        where_cond = " OR ".join(
-            ["A." + name + "_match= False" for name in self.columns_compared]
-        )
-        mismatch_query = """SELECT * FROM matched_table A WHERE {}""".format(where_cond)
-        self._all_rows_mismatched = self.spark.sql(mismatch_query).orderBy(
-            self._join_column_names  # type: ignore[arg-type]
-        )
-
-    def _get_or_create_joined_dataframe(self) -> "pyspark.sql.DataFrame":
-        if self._joined_dataframe is None:
-            join_condition = " AND ".join(
-                ["A." + name + "<=>B." + name for name in self._join_column_names]
-            )
-            select_statement = self._generate_select_statement(match_data=True)
-
-            self.base_df.createOrReplaceTempView("base_table")
-            self.compare_df.createOrReplaceTempView("compare_table")
-
-            join_query = r"""
-                   SELECT {}
-                   FROM base_table A
-                   JOIN compare_table B
-                   ON {}""".format(
-                select_statement, join_condition
-            )
-
-            self._joined_dataframe = self.spark.sql(join_query)
-            if self.cache_intermediates:
-                self._joined_dataframe.cache()
-                self._common_row_count = self._joined_dataframe.count()
-
-        return self._joined_dataframe
-
-    def _print_num_of_rows_with_column_equality(self, myfile: TextIO) -> None:
-        # match_dataframe contains columns from both dataframes with flag to indicate if columns matched
-        match_dataframe = self._get_or_create_joined_dataframe().select(
-            *self.columns_compared
-        )
-        match_dataframe.createOrReplaceTempView("matched_df")
-
-        where_cond = " AND ".join(
-            [
-                "A." + name + "=" + str(MatchType.MATCH.value)
-                for name in self.columns_compared
-            ]
-        )
-        match_query = (
-            r"""SELECT count(*) AS row_count FROM matched_df A WHERE {}""".format(
-                where_cond
-            )
-        )
-        all_rows_matched = self.spark.sql(match_query)
-        all_rows_matched_head = all_rows_matched.head()
-        matched_rows = (
-            all_rows_matched_head[0] if all_rows_matched_head is not None else 0
-        )
-
-        print("\n****** Row Comparison ******", file=myfile)
-        print(
-            f"Number of rows with some columns unequal: {self.common_row_count - matched_rows}",
-            file=myfile,
-        )
-        print(f"Number of rows with all columns equal: {matched_rows}", file=myfile)
-
-    def _populate_columns_match_dict(self) -> None:
-        """
-        side effects:
-            columns_match_dict assigned to { column -> match_type_counts }
-                where:
-                    column (string): Name of a column that exists in both the base and comparison columns
-                    match_type_counts (list of int with size = len(MatchType)): The number of each match type seen for this column (in order of the MatchType enum values)
-
-        returns: None
-        """
-
-        match_dataframe = self._get_or_create_joined_dataframe().select(
-            *self.columns_compared
-        )
-
-        def helper(c: str) -> "pyspark.sql.Column":
-            # Create a predicate for each match type, comparing column values to the match type value
-            predicates = [F.col(c) == k.value for k in MatchType]
-            # Create a tuple(number of match types found for each match type in this column)
-            return F.struct(
-                [F.lit(F.sum(pred.cast("integer"))) for pred in predicates]
-            ).alias(c)
-
-        # For each column, create a single tuple. This tuple's values correspond to the number of times
-        # each match type appears in that column
-        match_data_agg = match_dataframe.agg(
-            *[helper(col) for col in self.columns_compared]
-        ).collect()
-        match_data = match_data_agg[0]
-
-        for c in self.columns_compared:
-            self.columns_match_dict[c] = match_data[c]
-
-    def _create_select_statement(self, name: str) -> str:
-        if self._known_differences:
-            match_type_comparison = ""
-            for k in MatchType:
-                match_type_comparison += (
-                    " WHEN (A.{name}={match_value}) THEN '{match_name}'".format(
-                        name=name, match_value=str(k.value), match_name=k.name
-                    )
-                )
-            return "A.{name}_base, A.{name}_compare, (CASE WHEN (A.{name}={match_failure}) THEN False ELSE True END) AS {name}_match, (CASE {match_type_comparison} ELSE 'UNDEFINED' END) AS {name}_match_type ".format(
-                name=name,
-                match_failure=MatchType.MISMATCH.value,
-                match_type_comparison=match_type_comparison,
-            )
-        else:
-            return "A.{name}_base, A.{name}_compare, CASE WHEN (A.{name}={match_failure})  THEN False ELSE True END AS {name}_match ".format(
-                name=name, match_failure=MatchType.MISMATCH.value
-            )
-
-    def _create_case_statement(self, name: str) -> str:
-        equal_comparisons = ["(A.{name} IS NULL AND B.{name} IS NULL)"]
-        known_diff_comparisons = ["(FALSE)"]
-
-        base_dtype = [d[1] for d in self.base_df.dtypes if d[0] == name][0]
-        compare_dtype = [d[1] for d in self.compare_df.dtypes if d[0] == name][0]
-
-        if _is_comparable(base_dtype, compare_dtype):
-            if (base_dtype in NUMERIC_SPARK_TYPES) and (
-                compare_dtype in NUMERIC_SPARK_TYPES
-            ):  # numeric tolerance comparison
-                equal_comparisons.append(
-                    "((A.{name}=B.{name}) OR ((abs(A.{name}-B.{name}))<=("
-                    + str(self.abs_tol)
-                    + "+("
-                    + str(self.rel_tol)
-                    + "*abs(A.{name})))))"
-                )
-            else:  # non-numeric comparison
-                equal_comparisons.append("((A.{name}=B.{name}))")
-
-        if self._known_differences:
-            new_input = "B.{name}"
-            for kd in self._known_differences:
-                if compare_dtype in kd["types"]:
-                    if "flags" in kd and "nullcheck" in kd["flags"]:
-                        known_diff_comparisons.append(
-                            "(("
-                            + kd["transformation"].format(new_input, input=new_input)
-                            + ") is null AND A.{name} is null)"
-                        )
-                    else:
-                        known_diff_comparisons.append(
-                            "(("
-                            + kd["transformation"].format(new_input, input=new_input)
-                            + ") = A.{name})"
-                        )
-
-        case_string = (
-            "( CASE WHEN ("
-            + " OR ".join(equal_comparisons)
-            + ") THEN {match_success} WHEN ("
-            + " OR ".join(known_diff_comparisons)
-            + ") THEN {match_known_difference} ELSE {match_failure} END) "
-            + "AS {name}, A.{name} AS {name}_base, B.{name} AS {name}_compare"
-        )
-
-        return case_string.format(
-            name=name,
-            match_success=MatchType.MATCH.value,
-            match_known_difference=MatchType.KNOWN_DIFFERENCE.value,
-            match_failure=MatchType.MISMATCH.value,
-        )
-
-    def _print_row_summary(self, myfile: TextIO) -> None:
-        base_df_cnt = self.base_df.count()
-        compare_df_cnt = self.compare_df.count()
-        base_df_with_dup_cnt = self._original_base_df.count()
-        compare_df_with_dup_cnt = self._original_compare_df.count()
-
-        print("\n****** Row Summary ******", file=myfile)
-        print(f"Number of rows in common: {self.common_row_count}", file=myfile)
-        print(
-            f"Number of rows in base but not compare: {base_df_cnt - self.common_row_count}",
-            file=myfile,
-        )
-        print(
-            f"Number of rows in compare but not base: {compare_df_cnt - self.common_row_count}",
-            file=myfile,
-        )
-        print(
-            f"Number of duplicate rows found in base: {base_df_with_dup_cnt - base_df_cnt}",
-            file=myfile,
-        )
-        print(
-            f"Number of duplicate rows found in compare: {compare_df_with_dup_cnt - compare_df_cnt}",
-            file=myfile,
-        )
-
-    def _print_schema_diff_details(self, myfile: TextIO) -> None:
-        schema_diff_dict = self._columns_with_schemadiff()
-
-        if not schema_diff_dict:  # If there are no differences, don't print the section
-            return
-
-        # For columns with mismatches, what are the longest base and compare column name lengths (with minimums)?
-        base_name_max = max([len(key) for key in schema_diff_dict] + [16])
-        compare_name_max = max(
-            [len(self._base_to_compare_name(key)) for key in schema_diff_dict] + [19]
-        )
-
-        format_pattern = "{{:{base}s}}  {{:{compare}s}}".format(
-            base=base_name_max, compare=compare_name_max
-        )
-
-        print("\n****** Schema Differences ******", file=myfile)
-        print(
-            (format_pattern + "  Base Dtype     Compare Dtype").format(
-                "Base Column Name", "Compare Column Name"
-            ),
-            file=myfile,
-        )
-        print(
-            "-" * base_name_max
-            + "  "
-            + "-" * compare_name_max
-            + "  -------------  -------------",
-            file=myfile,
-        )
-
-        for base_column, types in schema_diff_dict.items():
-            compare_column = self._base_to_compare_name(base_column)
-
-            print(
-                (format_pattern + "  {:13s}  {:13s}").format(
-                    base_column,
-                    compare_column,
-                    types["base_type"],
-                    types["compare_type"],
-                ),
-                file=myfile,
-            )
-
-    def _base_to_compare_name(self, base_name: str) -> str:
-        """Translates a column name in the base dataframe to its counterpart in the
-        compare dataframe, if they are different."""
-
-        if base_name in self.column_mapping:
-            return self.column_mapping[base_name]
-        else:
-            for name in self.join_columns:
-                if base_name == name[0]:
-                    return name[1]
-            return base_name
-
-    def _print_row_matches_by_column(self, myfile: TextIO) -> None:
-        self._populate_columns_match_dict()
-        columns_with_mismatches = {
-            key: self.columns_match_dict[key]
-            for key in self.columns_match_dict
-            if self.columns_match_dict[key][MatchType.MISMATCH.value]
-        }
-        columns_fully_matching = {
-            key: self.columns_match_dict[key]
-            for key in self.columns_match_dict
-            if sum(self.columns_match_dict[key])
-            == self.columns_match_dict[key][MatchType.MATCH.value]
-        }
-        columns_with_any_diffs = {
-            key: self.columns_match_dict[key]
-            for key in self.columns_match_dict
-            if sum(self.columns_match_dict[key])
-            != self.columns_match_dict[key][MatchType.MATCH.value]
-        }
-        base_types = {x[0]: x[1] for x in self.base_df.dtypes}
-        compare_types = {x[0]: x[1] for x in self.compare_df.dtypes}
-
-        print("\n****** Column Comparison ******", file=myfile)
-
-        if self._known_differences:
-            print(
-                f"Number of columns compared with unexpected differences in some values: {len(columns_with_mismatches)}",
-                file=myfile,
-            )
-            print(
-                f"Number of columns compared with all values equal but known differences found: {len(self.columns_compared) - len(columns_with_mismatches) - len(columns_fully_matching)}",
-                file=myfile,
-            )
-            print(
-                f"Number of columns compared with all values completely equal: {len(columns_fully_matching)}",
-                file=myfile,
-            )
-        else:
-            print(
-                f"Number of columns compared with some values unequal: {len(columns_with_mismatches)}",
-                file=myfile,
-            )
-            print(
-                f"Number of columns compared with all values equal: {len(columns_fully_matching)}",
-                file=myfile,
-            )
-
-        # If all columns matched, don't print columns with unequal values
-        if (not self.show_all_columns) and (
-            len(columns_fully_matching) == len(self.columns_compared)
-        ):
-            return
-
-        # if show_all_columns is set, set column name length maximum to max of ALL columns(with minimum)
-        if self.show_all_columns:
-            base_name_max = max([len(key) for key in self.columns_match_dict] + [16])
-            compare_name_max = max(
-                [
-                    len(self._base_to_compare_name(key))
-                    for key in self.columns_match_dict
-                ]
-                + [19]
-            )
-
-        # For columns with any differences, what are the longest base and compare column name lengths (with minimums)?
-        else:
-            base_name_max = max([len(key) for key in columns_with_any_diffs] + [16])
-            compare_name_max = max(
-                [len(self._base_to_compare_name(key)) for key in columns_with_any_diffs]
-                + [19]
-            )
-
-        """ list of (header, condition, width, align)
-                where
-                    header (String) : output header for a column
-                    condition (Bool): true if this header should be displayed
-                    width (Int)     : width of the column
-                    align (Bool)    : true if right-aligned
-        """
-        headers_columns_unequal = [
-            ("Base Column Name", True, base_name_max, False),
-            ("Compare Column Name", True, compare_name_max, False),
-            ("Base Dtype   ", True, 13, False),
-            ("Compare Dtype", True, 13, False),
-            ("# Matches", True, 9, True),
-            ("# Known Diffs", self._known_differences is not None, 13, True),
-            ("# Mismatches", True, 12, True),
-        ]
-        if self.match_rates:
-            headers_columns_unequal.append(("Match Rate %", True, 12, True))
-        headers_columns_unequal_valid = [h for h in headers_columns_unequal if h[1]]
-        padding = 2  # spaces to add to left and right of each column
-
-        if self.show_all_columns:
-            print("\n****** Columns with Equal/Unequal Values ******", file=myfile)
-        else:
-            print("\n****** Columns with Unequal Values ******", file=myfile)
-
-        format_pattern = (" " * padding).join(
-            [
-                ("{:" + (">" if h[3] else "") + str(h[2]) + "}")
-                for h in headers_columns_unequal_valid
-            ]
-        )
-        print(
-            format_pattern.format(*[h[0] for h in headers_columns_unequal_valid]),
-            file=myfile,
-        )
-        print(
-            format_pattern.format(
-                *["-" * len(h[0]) for h in headers_columns_unequal_valid]
-            ),
-            file=myfile,
-        )
-
-        for column_name, column_values in sorted(
-            self.columns_match_dict.items(), key=lambda i: i[0]
-        ):
-            num_matches = column_values[MatchType.MATCH.value]
-            num_known_diffs = (
-                None
-                if self._known_differences is None
-                else column_values[MatchType.KNOWN_DIFFERENCE.value]
-            )
-            num_mismatches = column_values[MatchType.MISMATCH.value]
-            compare_column = self._base_to_compare_name(column_name)
-
-            if num_mismatches or num_known_diffs or self.show_all_columns:
-                output_row = [
-                    column_name,
-                    compare_column,
-                    base_types.get(column_name),
-                    compare_types.get(column_name),
-                    str(num_matches),
-                    str(num_mismatches),
-                ]
-                if self.match_rates:
-                    match_rate = 100 * (
-                        1
-                        - (column_values[MatchType.MISMATCH.value] + 0.0)
-                        / self.common_row_count
-                        + 0.0
-                    )
-                    output_row.append("{:02.5f}".format(match_rate))
-                if num_known_diffs is not None:
-                    output_row.insert(len(output_row) - 1, str(num_known_diffs))
-                print(format_pattern.format(*output_row), file=myfile)
-
-    # noinspection PyUnresolvedReferences
-    def report(self, file: TextIO = sys.stdout) -> None:
-        """Creates a comparison report and prints it to the file specified
-        (stdout by default).
+            self.join_columns = [str(col).lower() for col in join_columns]
+
+        self.df1 = df1.toDF(*[str(c).lower() for c in df1.columns])
+        self.df2 = df2.toDF(*[str(c).lower() for c in df2.columns])
+
+        self.df1_name = df1_name
+        self.df2_name = df2_name
+        self.abs_tol = abs_tol
+        self.rel_tol = rel_tol
+        self.df1_unq_rows = self.df2_unq_rows = self.intersect_rows = None
+        self.column_stats = []
+        self._compare(ignore_spaces, ignore_case)
+
+    @BaseCompare.df1.setter
+    def df1(self, df1):
+        """Check that it is a dataframe and has the join columns"""
+        self._df1 = df1
+        self._validate_dataframe("df1")
+
+    @BaseCompare.df2.setter
+    def df2(self, df2):
+        """Check that it is a dataframe and has the join columns"""
+        self._df2 = df2
+        self._validate_dataframe("df2")
+
+    def _validate_dataframe(self, index):
+        """Check that a dataframe has the join columns
 
         Parameters
         ----------
-        file : ``file``, optional
-            A filehandle to write the report to. By default, this is
-            sys.stdout, printing the report to stdout. You can also redirect
-            this to an output file, as in the example.
+        index : str
+            The "index" of the dataframe - df1 or df2.
 
-        Examples
-        --------
-        >>> with open('my_report.txt', 'w') as report_file:
-        ...     comparison.report(file=report_file)
+        Returns
+        -------
+        None
         """
+        dataframe = getattr(self, index)
 
-        self._print_columns_summary(file)
-        self._print_schema_diff_details(file)
-        self._print_only_columns("BASE", file)
-        self._print_only_columns("COMPARE", file)
-        self._print_row_summary(file)
-        self._merge_dataframes()
-        self._print_num_of_rows_with_column_equality(file)
-        self._print_row_matches_by_column(file)
+        # Check if join_columns are present in the dataframe
+        if not set(self.join_columns).issubset(set(dataframe.columns)):
+            raise ValueError("{} must have all columns from join_columns".format(index))
+
+        if len(set(dataframe.columns)) < len(dataframe.columns):
+            raise ValueError("{} must have unique column names".format(index))
+
+        if (
+            dataframe.drop_duplicates(subset=self.join_columns).count()
+            < dataframe.count()
+        ):
+            self._any_dupes = True
+
+    def _compare(self, ignore_spaces, ignore_case):
+        """Actually run the comparison.
+
+        This method will log out information about what is different between
+        the two dataframes, and will also return a boolean.
+
+        Unlike Pandas which tries to run df1.equals(df2) first so that if they're truly equal we
+        can tell. Spark does not have the same functionality.
+        """
+        LOG.warning(
+            "Number of columns in common: {}".format(len(self.intersect_columns()))
+        )
+        LOG.debug("Checking column overlap")
+        for col in self.df1_unq_columns():
+            LOG.warning("Column in df1 and not in df2: {}".format(col))
+        LOG.warning(
+            "Number of columns in df1 and not in df2: {}".format(
+                len(self.df1_unq_columns())
+            )
+        )
+        for col in self.df2_unq_columns():
+            LOG.warning("Column in df2 and not in df1: {}".format(col))
+        LOG.warning(
+            "Number of columns in df2 and not in df1: {}".format(
+                len(self.df2_unq_columns())
+            )
+        )
+
+        if self._any_dupes:
+            LOG.warning("Dropping duplicates")
+            self.df1 = self.df1.dropDuplicates(self.join_columns)
+            self.df2 = self.df2.dropDuplicates(self.join_columns)
+
+        LOG.debug("Merging dataframes")
+        self._dataframe_merge(ignore_spaces)
+        self._intersect_compare(ignore_spaces, ignore_case)
+        if self.matches():
+            LOG.warning("df1 matches df2")
+        else:
+            LOG.warning("df1 does not match df2")
+
+    def df1_unq_columns(self):
+        """Get columns that are unique to df1"""
+        return OrderedSet(self.df1.columns) - OrderedSet(self.df2.columns)
+
+    def df2_unq_columns(self):
+        """Get columns that are unique to df2"""
+        return OrderedSet(self.df2.columns) - OrderedSet(self.df1.columns)
+
+    def intersect_columns(self):
+        """Get columns that are shared between the two dataframes"""
+        return OrderedSet(self.df1.columns) & OrderedSet(self.df2.columns)
+
+    def non_join_columns(self):
+        """Get columns that are shared between the two dataframes excluding join_columns"""
+        return (
+            OrderedSet(self.df1.columns) | OrderedSet(self.df2.columns)
+        ) - OrderedSet(self.join_columns)
+
+    def _generate_merge_indicator(self):
+        self.df1_renamed = self.df1_renamed.join(
+            self.df1_renamed.select(self.join_columns)
+            .join(
+                self.df2_renamed.select(self.join_columns),
+                on=self.join_columns,
+                how="left_anti",
+            )
+            .withColumn("_merge_left", lit("left_only")),
+            on=self.join_columns,
+            how="left",
+        ).fillna("both", "_merge_left")
+
+        self.df2_renamed = self.df2_renamed.join(
+            self.df2_renamed.select(self.join_columns)
+            .join(
+                self.df1_renamed.select(self.join_columns),
+                on=self.join_columns,
+                how="left_anti",
+            )
+            .withColumn("_merge_right", lit("right_only")),
+            on=self.join_columns,
+            how="left",
+        ).fillna("both", "_merge_right")
+
+    def _dataframe_merge(self, ignore_spaces):
+        """Merge df1 to df2 on the join columns, to get df1 - df2, df2 - df1
+        and df1 & df2
+        """
+        LOG.debug("Outer joining")
+        params = {"on": self.join_columns}
+
+        if ignore_spaces:
+            for column in self.join_columns:
+                df1_dtype, _ = get_column_dtypes(self.df1, column, column)
+                df2_dtype, _ = get_column_dtypes(self.df2, column, column)
+                if df1_dtype == "string":
+                    self.df1 = self.df1.withColumn(column, trim(col(column)))
+                if df2_dtype == "string":
+                    self.df2 = self.df2.withColumn(column, trim(col(column)))
+
+        # add suffixes using non_join_columns
+        self.df1_renamed = self.df1
+        self.df2_renamed = self.df2
+
+        for c in self.non_join_columns():
+            self.df1_renamed = self.df1_renamed.withColumnRenamed(
+                c, "{}{}".format(c, "_df1")
+            )
+            self.df2_renamed = self.df2_renamed.withColumnRenamed(
+                c, "{}{}".format(c, "_df2")
+            )
+
+        self._generate_merge_indicator()
+
+        # Null safe logic for the outer join
+        ############
+        conditions = []
+        for c in self.join_columns:
+            self.df1_renamed = self.df1_renamed.withColumnRenamed(
+                c, "{}{}".format(c, "_df1")
+            )
+            self.df2_renamed = self.df2_renamed.withColumnRenamed(
+                c, "{}{}".format(c, "_df2")
+            )
+            conditions.append(
+                self.df1_renamed[c + "_df1"].eqNullSafe(self.df2_renamed[c + "_df2"])
+            )
+        outer_join = self.df1_renamed.join(self.df2_renamed, conditions, how="outer")
+
+        # merge indicator corner case with nulls
+        outer_join = outer_join.withColumn(
+            "_merge_left",
+            when(
+                (outer_join["_merge_left"] == "both")
+                & (isnull(outer_join["_merge_right"])),
+                "left_only",
+            ).otherwise(outer_join["_merge_left"]),
+        )
+        outer_join = outer_join.withColumn(
+            "_merge_right",
+            when(
+                (outer_join["_merge_right"] == "both")
+                & (isnull(outer_join["_merge_left"])),
+                "right_only",
+            ).otherwise(outer_join["_merge_right"]),
+        )
+
+        # cleanup _merge_left and _merge_right into _merge
+        outer_join = outer_join.withColumn(
+            "_merge", coalesce(outer_join["_merge_left"], outer_join["_merge_right"])
+        )
+
+        # collapse join_columns back into one set of columns from _df1 / _df2
+        for c in self.join_columns:
+            outer_join = outer_join.withColumn(
+                c,
+                when(
+                    outer_join["_merge"].isin(["left_only", "both"]),
+                    outer_join[c + "_df1"],
+                ).otherwise(outer_join[c + "_df2"]),
+            )
+            # outer_join = outer_join.withColumn(col, when(outer_join["_merge"] == "right_only", ))
+            outer_join = outer_join.drop(c + "_df1", c + "_df2")
+
+        df1_cols = get_merged_columns(self.df1.drop("_merge_left"), outer_join, "_df1")
+        df2_cols = get_merged_columns(self.df2.drop("_merge_right"), outer_join, "_df2")
+
+        LOG.debug("Selecting df1 unique rows")
+        self.df1_unq_rows = outer_join.select(df1_cols).where("_merge = 'left_only'")
+
+        LOG.debug("Selecting df2 unique rows")
+        self.df2_unq_rows = outer_join.select(df2_cols).where("_merge = 'right_only'")
+        LOG.warning(
+            "Number of rows in df1 and not in df2: {}".format(self.df1_unq_rows.count())
+        )
+        LOG.warning(
+            "Number of rows in df2 and not in df1: {}".format(self.df2_unq_rows.count())
+        )
+
+        LOG.debug("Selecting intersecting rows")
+        self.intersect_rows = outer_join.where("_merge = 'both'")
+        LOG.warning(
+            "Number of rows in df1 and df2 (not necessarily equal): {}".format(
+                self.intersect_rows.count()
+            )
+        )
+
+    def _intersect_compare(self, ignore_spaces, ignore_case):
+        """Run the comparison on the intersect dataframe
+
+        This loops through all columns that are shared between df1 and df2, and
+        creates a column column_match which is True for matches, False
+        otherwise.
+        """
+        LOG.debug("Comparing intersection")
+        row_cnt = self.intersect_rows.count()
+        for column in self.intersect_columns():
+            if column in self.join_columns:
+                match_cnt = row_cnt
+                col_match = ""
+                max_diff = 0
+                null_diff = 0
+            else:
+                col_1 = column + "_df1"
+                col_2 = column + "_df2"
+                col_match = column + "_match"
+
+                self.intersect_rows = columns_equal(
+                    self.intersect_rows,
+                    col_1,
+                    col_2,
+                    col_match,
+                    self.rel_tol,
+                    self.abs_tol,
+                    ignore_spaces,
+                    ignore_case,
+                )
+                match_cnt = (
+                    self.intersect_rows.select(col_match)
+                    .where(col(col_match) == True)
+                    .count()
+                )
+                max_diff = calculate_max_diff(self.intersect_rows, col_1, col_2)
+                null_diff = calculate_null_diff(self.intersect_rows, col_1, col_2)
+
+            if row_cnt > 0:
+                match_rate = float(match_cnt) / row_cnt
+            else:
+                match_rate = 0
+            LOG.warning(
+                "{}: {} / {} ({:.2%}) match".format(
+                    column, match_cnt, row_cnt, match_rate
+                )
+            )
+
+            col1_dtype, _ = get_column_dtypes(self.df1, column, column)
+            col2_dtype, _ = get_column_dtypes(self.df2, column, column)
+
+            self.column_stats.append(
+                {
+                    "column": column,
+                    "match_column": col_match,
+                    "match_cnt": match_cnt,
+                    "unequal_cnt": row_cnt - match_cnt,
+                    "dtype1": str(col1_dtype),
+                    "dtype2": str(col2_dtype),
+                    "all_match": all(
+                        (
+                            col1_dtype == col2_dtype,
+                            row_cnt == match_cnt,
+                        )
+                    ),
+                    "max_diff": max_diff,
+                    "null_diff": null_diff,
+                }
+            )
+
+    def all_columns_match(self):
+        """Whether the columns all match in the dataframes"""
+        return self.df1_unq_columns() == self.df2_unq_columns() == set()
+
+    def all_rows_overlap(self):
+        """Whether the rows are all present in both dataframes
+
+        Returns
+        -------
+        bool
+            True if all rows in df1 are in df2 and vice versa (based on
+            existence for join option)
+        """
+        return self.df1_unq_rows.count() == self.df2_unq_rows.count() == 0
+
+    def count_matching_rows(self):
+        """Count the number of rows match (on overlapping fields)
+
+        Returns
+        -------
+        int
+            Number of matching rows
+        """
+        conditions = []
+        for column in self.intersect_columns():
+            if column not in self.join_columns:
+                match_columns = column + "_match"
+                conditions.append("{} == True".format(match_columns))
+        if len(conditions) > 0:
+            match_columns_count = self.intersect_rows.filter(
+                " and ".join(conditions)
+            ).count()
+        else:
+            match_columns_count = 0
+        return match_columns_count
+
+    def intersect_rows_match(self):
+        """Check whether the intersect rows all match"""
+        actual_length = self.intersect_rows.count()
+        return self.count_matching_rows() == actual_length
+
+    def matches(self, ignore_extra_columns=False):
+        """Return True or False if the dataframes match.
+
+        Parameters
+        ----------
+        ignore_extra_columns : bool
+            Ignores any columns in one dataframe and not in the other.
+        """
+        if not ignore_extra_columns and not self.all_columns_match():
+            return False
+        elif not self.all_rows_overlap():
+            return False
+        elif not self.intersect_rows_match():
+            return False
+        else:
+            return True
+
+    def subset(self):
+        """Return True if dataframe 2 is a subset of dataframe 1.
+
+        Dataframe 2 is considered a subset if all of its columns are in
+        dataframe 1, and all of its rows match rows in dataframe 1 for the
+        shared columns.
+        """
+        if not self.df2_unq_columns() == set():
+            return False
+        elif not self.df2_unq_rows.count() == 0:
+            return False
+        elif not self.intersect_rows_match():
+            return False
+        else:
+            return True
+
+    def sample_mismatch(self, column, sample_count=10):
+        """Returns a sample sub-dataframe which contains the identifying
+        columns, and df1 and df2 versions of the column.
+
+        Parameters
+        ----------
+        column : str
+            The raw column name (i.e. without ``_df1`` appended)
+        sample_count : int, optional
+            The number of sample records to return.  Defaults to 10.
+
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            A sample of the intersection dataframe, containing only the
+            "pertinent" columns, for rows that don't match on the provided
+            column.
+        """
+        row_cnt = self.intersect_rows.count()
+        col_match = self.intersect_rows.select(column + "_match")
+        match_cnt = col_match.where(col(column + "_match") == True).count()
+        sample_count = min(sample_count, row_cnt - match_cnt)
+        sample = (
+            self.intersect_rows.where(col(column + "_match") == False)
+            .drop(column + "_match")
+            .limit(sample_count)
+        )
+        return_cols = self.join_columns + [column + "_df1", column + "_df2"]
+        to_return = sample.select(return_cols)
+        return to_return
+
+    def all_mismatch(self):
+        """All rows with any columns that have a mismatch. Returns all df1 and df2 versions of the
+        columns and join columns.
+
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            All rows of the intersection dataframe, containing any columns, that don't match.
+        """
+        match_list = []
+        return_list = []
+        for col in self.intersect_rows.columns:
+            if col.endswith("_match"):
+                match_list.append(col)
+                return_list.extend([col[:-6] + "_df1", col[:-6] + "_df2"])
+
+        mm_rows = self.intersect_rows.withColumn(
+            "match_array", array(match_list)
+        ).where(array_contains("match_array", False))
+        return mm_rows.select(self.join_columns + return_list)
+
+    def report(self, sample_count=10, column_count=10):
+        """Returns a string representation of a report.  The representation can
+        then be printed or saved to a file.
+
+        Parameters
+        ----------
+        sample_count : int, optional
+            The number of sample records to return.  Defaults to 10.
+
+        column_count : int, optional
+            The number of columns to display in the sample records output.  Defaults to 10.
+
+        Returns
+        -------
+        str
+            The report, formatted kinda nicely.
+        """
+        # Header
+        report = render("header.txt")
+        df_header = pd.DataFrame(
+            {
+                "DataFrame": [self.df1_name, self.df2_name],
+                "Columns": [len(self.df1.columns), len(self.df2.columns)],
+                "Rows": [self.df1.count(), self.df2.count()],
+            }
+        )
+        report += df_header[["DataFrame", "Columns", "Rows"]].to_string()
+        report += "\n\n"
+
+        # Column Summary
+        report += render(
+            "column_summary.txt",
+            len(self.intersect_columns()),
+            len(self.df1_unq_columns()),
+            len(self.df2_unq_columns()),
+            self.df1_name,
+            self.df2_name,
+        )
+
+        # Row Summary
+        match_on = ", ".join(self.join_columns)
+        report += render(
+            "row_summary.txt",
+            match_on,
+            self.abs_tol,
+            self.rel_tol,
+            self.intersect_rows.count(),
+            self.df1_unq_rows.count(),
+            self.df2_unq_rows.count(),
+            self.intersect_rows.count() - self.count_matching_rows(),
+            self.count_matching_rows(),
+            self.df1_name,
+            self.df2_name,
+            "Yes" if self._any_dupes else "No",
+        )
+
+        # Column Matching
+        cnt_intersect = self.intersect_rows.count()
+        report += render(
+            "column_comparison.txt",
+            len([col for col in self.column_stats if col["unequal_cnt"] > 0]),
+            len([col for col in self.column_stats if col["unequal_cnt"] == 0]),
+            sum([col["unequal_cnt"] for col in self.column_stats]),
+        )
+
+        match_stats = []
+        match_sample = []
+        any_mismatch = False
+        for column in self.column_stats:
+            if not column["all_match"]:
+                any_mismatch = True
+                match_stats.append(
+                    {
+                        "Column": column["column"],
+                        "{} dtype".format(self.df1_name): column["dtype1"],
+                        "{} dtype".format(self.df2_name): column["dtype2"],
+                        "# Unequal": column["unequal_cnt"],
+                        "Max Diff": column["max_diff"],
+                        "# Null Diff": column["null_diff"],
+                    }
+                )
+                if column["unequal_cnt"] > 0:
+                    match_sample.append(
+                        self.sample_mismatch(column["column"], sample_count)
+                    )
+
+        if any_mismatch:
+            report += "Columns with Unequal Values or Types\n"
+            report += "------------------------------------\n"
+            report += "\n"
+            df_match_stats = pd.DataFrame(match_stats)
+            df_match_stats.sort_values("Column", inplace=True)
+            # Have to specify again for sorting
+            report += df_match_stats[
+                [
+                    "Column",
+                    "{} dtype".format(self.df1_name),
+                    "{} dtype".format(self.df2_name),
+                    "# Unequal",
+                    "Max Diff",
+                    "# Null Diff",
+                ]
+            ].to_string()
+            report += "\n\n"
+
+            if sample_count > 0:
+                report += "Sample Rows with Unequal Values\n"
+                report += "-------------------------------\n"
+                report += "\n"
+                for sample in match_sample:
+                    report += sample._jdf.showString(20, 20, False)
+                    report += "\n\n"
+
+        if min(sample_count, self.df1_unq_rows.count()) > 0:
+            report += "Sample Rows Only in {} (First {} Columns)\n".format(
+                self.df1_name, column_count
+            )
+            report += "---------------------------------------{}\n".format(
+                "-" * len(self.df1_name)
+            )
+            report += "\n"
+            columns = self.df1_unq_rows.columns[:column_count]
+            unq_count = min(sample_count, self.df1_unq_rows.count())
+            report += (
+                self.df1_unq_rows.limit(unq_count)
+                .select(columns)
+                ._jdf.showString(20, 20, False)
+            )
+            report += "\n\n"
+
+        if min(sample_count, self.df2_unq_rows.count()) > 0:
+            report += "Sample Rows Only in {} (First {} Columns)\n".format(
+                self.df2_name, column_count
+            )
+            report += "---------------------------------------{}\n".format(
+                "-" * len(self.df2_name)
+            )
+            report += "\n"
+            columns = self.df2_unq_rows.columns[:column_count]
+            unq_count = min(sample_count, self.df2_unq_rows.count())
+            report += (
+                self.df2_unq_rows.limit(unq_count)
+                .select(columns)
+                ._jdf.showString(20, 20, False)
+            )
+            report += "\n\n"
+
+        return report
+
+
+def render(filename, *fields):
+    """Renders out an individual template.  This basically just reads in a
+    template file, and applies ``.format()`` on the fields.
+
+    Parameters
+    ----------
+    filename : str
+        The file that contains the template.  Will automagically prepend the
+        templates directory before opening
+    fields : list
+        Fields to be rendered out in the template
+
+    Returns
+    -------
+    str
+        The fully rendered out file.
+    """
+    this_dir = os.path.dirname(os.path.realpath(__file__))
+    with open(os.path.join(this_dir, "templates", filename)) as file_open:
+        return file_open.read().format(*fields)
+
+
+def columns_equal(
+    dataframe,
+    col_1,
+    col_2,
+    col_match,
+    rel_tol=0,
+    abs_tol=0,
+    ignore_spaces=False,
+    ignore_case=False,
+):
+    """Compares two columns from a dataframe, returning the DataFrame with a True/False column.
+
+    - Two nulls (np.nan) will evaluate to True.
+    - A null and a non-null value will evaluate to False.
+    - Numeric values will use the relative and absolute tolerances.
+    - Decimal values (decimal.Decimal) will attempt to be converted to floats
+      before comparing
+    - Non-numeric values (i.e. where np.isclose can't be used) will just
+      trigger True on two nulls or exact matches.
+
+    Parameters
+    ----------
+    dataframe: pyspark.sql.DataFrame
+        DataFrame to do comparison on
+    col_1 : str
+        The first column to look at
+    col_2 : str
+        The second column
+    col_match : str
+        The matching column denoting if the compare was a match or not
+    rel_tol : float, optional
+        Relative tolerance
+    abs_tol : float, optional
+        Absolute tolerance
+    ignore_spaces : bool, optional
+        Flag to strip whitespace (including newlines) from string columns
+    ignore_case : bool, optional
+        Flag to ignore the case of string columns
+
+    Notes
+    -----
+    For finite values, ``isclose`` uses the following equation to test whether two floating point
+    values are equivalent. To align with Pandas we will use the same for Spark.
+
+    absolute(a - b) <= (atol + rtol * absolute(b))
+
+    https://numpy.org/doc/stable/reference/generated/numpy.isclose.html#numpy-isclose
+
+    Returns
+    -------
+    pyspark.sql.DataFrame
+        A column of boolean values are added.  True == the values match, False == the
+        values don't match.
+    """
+    base_dtype, compare_dtype = get_column_dtypes(dataframe, col_1, col_2)
+    if _is_comparable(base_dtype, compare_dtype):
+        if (base_dtype in NUMERIC_SPARK_TYPES) and (
+            compare_dtype in NUMERIC_SPARK_TYPES
+        ):  # numeric tolerance comparison
+            dataframe = dataframe.withColumn(
+                col_match,
+                when(
+                    (col(col_1).eqNullSafe(col(col_2)))
+                    | (
+                        abs(col(col_1) - col(col_2))
+                        <= lit(abs_tol) + (lit(rel_tol) * abs(col(col_2)))
+                    ),
+                    # corner case of col1 != NaN and col2 == Nan returns True incorrectly
+                    when(
+                        (isnan(col(col_1)) == False) & (isnan(col(col_2)) == True),
+                        lit(False),
+                    ).otherwise(lit(True)),
+                ).otherwise(lit(False)),
+            )
+        else:  # non-numeric comparison
+            if ignore_case and not ignore_spaces:
+                when_clause = upper(col(col_1)).eqNullSafe(upper(col(col_2)))
+            elif not ignore_case and ignore_spaces:
+                when_clause = trim(col(col_1)).eqNullSafe(trim(col(col_2)))
+            elif ignore_case and ignore_spaces:
+                when_clause = upper(trim(col(col_1))).eqNullSafe(
+                    upper(trim(col(col_2)))
+                )
+            else:
+                when_clause = col(col_1).eqNullSafe(col(col_2))
+
+            dataframe = dataframe.withColumn(
+                col_match,
+                when(when_clause, lit(True)).otherwise(lit(False)),
+            )
+    else:
+        LOG.debug(
+            "Skipping {}({}) and {}({}), columns are not comparable".format(
+                col_1, base_dtype, col_2, compare_dtype
+            )
+        )
+    return dataframe
+
+
+def get_merged_columns(original_df, merged_df, suffix):
+    """Gets the columns from an original dataframe, in the new merged dataframe
+
+    Parameters
+    ----------
+    original_df : pyspark.sql.DataFrame
+        The original, pre-merge dataframe
+    merged_df : pyspark.sql.DataFrame
+        Post-merge with another dataframe, with suffixes added in.
+    suffix : str
+        What suffix was used to distinguish when the original dataframe was
+        overlapping with the other merged dataframe.
+    """
+    columns = []
+    for col in original_df.columns:
+        if col in merged_df.columns:
+            columns.append(col)
+        elif col + suffix in merged_df.columns:
+            columns.append(col + suffix)
+        else:
+            raise ValueError("Column not found: %s", col)
+    return columns
+
+
+def temp_column_name(*dataframes):
+    """Gets a temp column name that isn't included in columns of any dataframes
+
+    Parameters
+    ----------
+    dataframes : list of pyspark.sql.DataFrame
+        The DataFrames to create a temporary column name for
+
+    Returns
+    -------
+    str
+        String column name that looks like '_temp_x' for some integer x
+    """
+    column_names = []
+    for dataframe in dataframes:
+        column_names.extend(dataframe.columns)
+    i = 0
+    while True:
+        temp_column = "_temp_{}".format(i)
+        unique = True
+        for col in set(column_names):
+            if temp_column in col:
+                i += 1
+                unique = False
+        if unique:
+            return temp_column
+
+
+def calculate_max_diff(dataframe, col_1, col_2):
+    """Get a maximum difference between two columns
+
+    Parameters
+    ----------
+    dataframe: pyspark.sql.DataFrame
+        DataFrame to do comparison on
+    col_1 : str
+        The first column to look at
+    col_2 : str
+        The second column
+
+    Returns
+    -------
+    Numeric
+        Numeric field, or zero if NaN, Null, or None.
+    """
+    diff = dataframe.select(
+        (col(col_1).astype("float") - col(col_2).astype("float")).alias("diff")
+    )
+    abs_diff = diff.select(abs(col("diff")).alias("abs_diff"))
+    max_diff = (
+        abs_diff.where(isnan(col("abs_diff")) == False)
+        .agg({"abs_diff": "max"})
+        .collect()[0][0]
+    )
+
+    if pd.isna(max_diff) or pd.isnull(max_diff) or max_diff is None:
+        return 0
+    else:
+        return max_diff
+
+
+def calculate_null_diff(dataframe, col_1, col_2):
+    """Get the null differences between two columns
+
+    Parameters
+    ----------
+    dataframe: pyspark.sql.DataFrame
+        DataFrame to do comparison on
+    col_1 : str
+        The first column to look at
+    col_2 : str
+        The second column
+
+    Returns
+    -------
+    Numeric
+        Numeric field, or zero if NaN, Null, or None.
+    """
+    nulls_df = dataframe.withColumn(
+        "col_1_null", when(col(col_1).isNull() == True, lit(True)).otherwise(lit(False))
+    )
+    nulls_df = nulls_df.withColumn(
+        "col_2_null", when(col(col_2).isNull() == True, lit(True)).otherwise(lit(False))
+    ).select(["col_1_null", "col_2_null"])
+
+    # (not a and b) or (a and not b)
+    null_diff = nulls_df.where(
+        ((col("col_1_null") == False) & (col("col_2_null") == True))
+        | ((col("col_1_null") == True) & (col("col_2_null") == False))
+    ).count()
+
+    if pd.isna(null_diff) or pd.isnull(null_diff) or null_diff is None:
+        return 0
+    else:
+        return null_diff
+
+
+def get_column_dtypes(dataframe, col_1, col_2):
+    """Get the dtypes of two columns
+
+    Parameters
+    ----------
+    dataframe: pyspark.sql.DataFrame
+        DataFrame to do comparison on
+    col_1 : str
+        The first column to look at
+    col_2 : str
+        The second column
+
+    Returns
+    -------
+    Tuple(str, str)
+        Tuple of base and compare datatype
+    """
+    base_dtype = [d[1] for d in dataframe.dtypes if d[0] == col_1][0]
+    compare_dtype = [d[1] for d in dataframe.dtypes if d[0] == col_2][0]
+    return base_dtype, compare_dtype
