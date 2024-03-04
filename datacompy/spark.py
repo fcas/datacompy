@@ -32,7 +32,6 @@ from pyspark.sql.functions import (
     abs,
     array,
     array_contains,
-    coalesce,
     col,
     isnan,
     isnull,
@@ -284,31 +283,6 @@ class SparkCompare(BaseCompare):
             OrderedSet(self.df1.columns) | OrderedSet(self.df2.columns)
         ) - OrderedSet(self.join_columns)
 
-    def _generate_merge_indicator(self):
-        self.df1_renamed = self.df1_renamed.join(
-            self.df1_renamed.select(self.join_columns)
-            .join(
-                self.df2_renamed.select(self.join_columns),
-                on=self.join_columns,
-                how="left_anti",
-            )
-            .withColumn("_merge_left", lit("left_only")),
-            on=self.join_columns,
-            how="left",
-        ).fillna("both", "_merge_left")
-
-        self.df2_renamed = self.df2_renamed.join(
-            self.df2_renamed.select(self.join_columns)
-            .join(
-                self.df1_renamed.select(self.join_columns),
-                on=self.join_columns,
-                how="left_anti",
-            )
-            .withColumn("_merge_right", lit("right_only")),
-            on=self.join_columns,
-            how="left",
-        ).fillna("both", "_merge_right")
-
     def _dataframe_merge(self, ignore_spaces):
         """Merge df1 to df2 on the join columns, to get df1 - df2, df2 - df1
         and df1 & df2
@@ -337,7 +311,12 @@ class SparkCompare(BaseCompare):
                 c, "{}{}".format(c, "_df2")
             )
 
-        self._generate_merge_indicator()
+        #### new logic for indicators
+        self.df1_renamed = self.df1_renamed.withColumn("_merge_left", lit("left_only"))
+        self.df2_renamed = self.df2_renamed.withColumn(
+            "_merge_right", lit("right_only")
+        )
+        ####
 
         # Null safe logic for the outer join
         ############
@@ -354,27 +333,20 @@ class SparkCompare(BaseCompare):
             )
         outer_join = self.df1_renamed.join(self.df2_renamed, conditions, how="outer")
 
-        # merge indicator corner case with nulls
+        # merge indicator distinguish between left, right and both
         outer_join = outer_join.withColumn(
-            "_merge_left",
+            "_merge",
             when(
-                (outer_join["_merge_left"] == "both")
+                (outer_join["_merge_left"] == "left_only")
                 & (isnull(outer_join["_merge_right"])),
                 "left_only",
-            ).otherwise(outer_join["_merge_left"]),
-        )
-        outer_join = outer_join.withColumn(
-            "_merge_right",
-            when(
-                (outer_join["_merge_right"] == "both")
-                & (isnull(outer_join["_merge_left"])),
-                "right_only",
-            ).otherwise(outer_join["_merge_right"]),
-        )
-
-        # cleanup _merge_left and _merge_right into _merge
-        outer_join = outer_join.withColumn(
-            "_merge", coalesce(outer_join["_merge_left"], outer_join["_merge_right"])
+            ).otherwise(
+                when(
+                    (outer_join["_merge_right"] == "right_only")
+                    & (isnull(outer_join["_merge_left"])),
+                    "right_only",
+                ).otherwise("both")
+            ),
         )
 
         # collapse join_columns back into one set of columns from _df1 / _df2
@@ -386,7 +358,6 @@ class SparkCompare(BaseCompare):
                     outer_join[c + "_df1"],
                 ).otherwise(outer_join[c + "_df2"]),
             )
-            # outer_join = outer_join.withColumn(col, when(outer_join["_merge"] == "right_only", ))
             outer_join = outer_join.drop(c + "_df1", c + "_df2")
 
         df1_cols = get_merged_columns(self.df1.drop("_merge_left"), outer_join, "_df1")
@@ -665,7 +636,6 @@ class SparkCompare(BaseCompare):
         )
 
         # Column Matching
-        cnt_intersect = self.intersect_rows.count()
         report += render(
             "column_comparison.txt",
             len([col for col in self.column_stats if col["unequal_cnt"] > 0]),
