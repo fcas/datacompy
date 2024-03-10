@@ -824,7 +824,7 @@ def columns_equal(
                     compare = pl.Series(
                         (col_1.eq_missing(col_2)) | (col_1.is_null() & col_2.is_null())
                     )
-            except:
+            except Exception:
                 # Blanket exception should just return all False
                 compare = pl.Series(False * col_1.shape[0])
     return compare
@@ -861,7 +861,7 @@ def compare_string_and_date_columns(
             (str_column.str.to_datetime().eq_missing(date_column))
             | (str_column.is_null() & date_column.is_null())
         )
-    except:
+    except Exception:
         return pl.Series([False] * col_1.shape[0])
 
 
@@ -935,7 +935,7 @@ def calculate_max_diff(col_1: "pl.Series", col_2: "pl.Series") -> float:
         return cast(
             float, (col_1.cast(pl.Float64) - col_2.cast(pl.Float64)).abs().max()
         )
-    except:
+    except Exception:
         return 0.0
 
 
