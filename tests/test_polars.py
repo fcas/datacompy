@@ -1238,7 +1238,7 @@ def test_dupes_with_nulls():
     ],
 )
 def test_generate_id_within_group(dataframe, expected):
-    assert (generate_id_within_group(dataframe, ["a", "b"]) == expected).all()
+    assert (generate_id_within_group(dataframe.lazy(), ["a", "b"]) == expected).all()
 
 
 @pytest.mark.parametrize(
@@ -1252,7 +1252,7 @@ def test_generate_id_within_group(dataframe, expected):
 )
 def test_generate_id_within_group_valueerror(dataframe, message):
     with raises(ValueError, match=message):
-        generate_id_within_group(dataframe, ["a", "b"])
+        generate_id_within_group(dataframe.lazy(), ["a", "b"])
 
 
 def test_lower():
