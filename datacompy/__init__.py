@@ -1,5 +1,5 @@
 #
-# Copyright 2024 Capital One Services, LLC
+# Copyright 2026 Capital One Services, LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,18 +12,50 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""DataComPy is a package to compare two Pandas DataFrames.
 
-__version__ = "0.12.0"
+Originally started to be something of a replacement for SAS's PROC COMPARE for Pandas DataFrames with some more functionality than just Pandas.DataFrame.equals(Pandas.DataFrame) (in that it prints out some stats, and lets you tweak how accurate matches have to be).
+Then extended to carry that functionality over to Spark Dataframes.
+"""
 
-from datacompy.core import *
-from datacompy.fugue import (
-    all_columns_match,
-    all_rows_overlap,
-    count_matching_rows,
-    intersect_columns,
-    is_match,
-    report,
-    unq_columns,
-)
+__version__ = "1.0.4"
+
+from datacompy.base import BaseCompare
+from datacompy.pandas import PandasCompare
 from datacompy.polars import PolarsCompare
-from datacompy.spark import SparkCompare
+from datacompy.report import (
+    ColumnComparison,
+    ColumnSummary,
+    MismatchStat,
+    MismatchStats,
+    ReportData,
+    RowSummary,
+    UniqueRowsData,
+)
+
+__all__ = [
+    "BaseCompare",
+    "ColumnComparison",
+    "ColumnSummary",
+    "MismatchStat",
+    "MismatchStats",
+    "PandasCompare",
+    "PolarsCompare",
+    "ReportData",
+    "RowSummary",
+    "UniqueRowsData",
+]
+
+try:
+    from datacompy.snowflake import SnowflakeCompare  # noqa: F401
+
+    __all__.append("SnowflakeCompare")
+except ImportError:
+    pass
+
+try:
+    from datacompy.spark import SparkSQLCompare  # noqa: F401
+
+    __all__.append("SparkSQLCompare")
+except ImportError:
+    pass

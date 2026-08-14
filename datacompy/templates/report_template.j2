@@ -1,0 +1,97 @@
+DataComPy Comparison
+-------------------
+
+DataFrame Summary
+-----------------
+
+{{ fixed_width_table(
+    ['DataFrame', 'Columns', 'Rows'],
+    [[df1_name, '{:,}'.format(df1_shape[1]), '{:,}'.format(df1_shape[0])],
+     [df2_name, '{:,}'.format(df2_shape[1]), '{:,}'.format(df2_shape[0])]],
+    'lrr') }}
+
+
+Column Summary
+--------------
+
+Number of columns in common: {{ column_summary.common_columns }}
+Number of columns in {{ column_summary.df1_name }} but not in {{ column_summary.df2_name }}: {{ column_summary.df1_unique ~ " " ~ column_summary.df1_unique_columns | list if column_summary.df1_unique_columns else column_summary.df1_unique }}
+Number of columns in {{ column_summary.df2_name }} but not in {{ column_summary.df1_name }}: {{ column_summary.df2_unique ~ " " ~ column_summary.df2_unique_columns | list if column_summary.df2_unique_columns else column_summary.df2_unique }}
+
+Row Summary
+-----------
+
+Matched on: {{ "index" if row_summary.on_index else row_summary.match_columns | join(", ") }}
+Any duplicates on match values: {{ "Yes" if row_summary.has_duplicates else "No" }}
+Default Absolute Tolerance: {{ row_summary.abs_tol }}
+Default Relative Tolerance: {{ row_summary.rel_tol }}
+Number of rows in common: {{ "{:,}".format(row_summary.common_rows) }}
+Number of rows in {{ row_summary.df1_name }} but not in {{ row_summary.df2_name }}: {{ "{:,}".format(row_summary.df1_unique) }}
+Number of rows in {{ row_summary.df2_name }} but not in {{ row_summary.df1_name }}: {{ "{:,}".format(row_summary.df2_unique) }}
+
+Number of rows with some compared columns unequal: {{ "{:,}".format(row_summary.unequal_rows) }}
+Number of rows with all compared columns equal: {{ "{:,}".format(row_summary.equal_rows) }}
+
+Column Comparison
+-----------------
+
+Number of columns compared with some values unequal: {{ "{:,}".format(column_comparison.unequal_columns) }}
+Number of columns compared with all values equal: {{ "{:,}".format(column_comparison.equal_columns) }}
+Total number of values which compare unequal: {{ "{:,}".format(column_comparison.unequal_values) }}
+
+{% if mismatch_stats.has_mismatches %}
+Columns with Unequal Values or Types
+------------------------------------
+
+{% set stat_rows = [] %}
+{% for stat in mismatch_stats.stats %}
+{% do stat_rows.append([
+    stat.column if stat.column|length <= 20 else stat.column[:17] ~ '...',
+    stat.dtype1,
+    stat.dtype2,
+    '{:,}'.format(stat.unequal_cnt),
+    '%.4f'|format(stat.max_diff),
+    '{:,}'.format(stat.null_diff),
+    '%.4f'|format(stat.rel_tol),
+    '%.4f'|format(stat.abs_tol)]) %}
+{% endfor %}
+{{ fixed_width_table(
+    ['Column',
+     mismatch_stats.df1_name + ' dtype',
+     mismatch_stats.df2_name + ' dtype',
+     '# Unequal',
+     'Max Diff',
+     '# Null Diff',
+     'Rel Tol',
+     'Abs Tol'],
+    stat_rows,
+    'lllrrrrr') }}
+
+{% if mismatch_stats.has_samples %}
+
+Sample Rows with Unequal Values
+-------------------------------
+
+{% for sample in mismatch_stats.samples %}
+{{ sample }}
+
+{% endfor %}
+{% endif %}
+
+{% endif %}
+
+{% if df1_unique_rows.has_rows %}
+Sample Rows Only in {{ df1_name }} (First {{ column_count }} Columns)
+{{ '---------------------------------------' + '-' * df1_name|length }}
+
+{% set rows = df1_unique_rows.rows %}
+{{ rows }}
+{% endif %}
+
+{% if df2_unique_rows.has_rows %}
+Sample Rows Only in {{ df2_name }} (First {{ column_count }} Columns)
+{{ '---------------------------------------' + '-' * df2_name|length }}
+
+{% set rows = df2_unique_rows.rows %}
+{{ rows }}
+{% endif %}

@@ -22,4 +22,12 @@ docs/source/api/
 
 #edgetest
 .edgetest/
-tmp/
+.tmp/
+
+test.html
+
+.coverage
+coverage.xml
+
+# benchmark datasets
+benchmarks/data/

@@ -1,99 +1,156 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = [ "setuptools>=64" ]
+
 [project]
 name = "datacompy"
-description = "Dataframe comparison in Python"
+description = "Dataframe comparisons in Python"
 readme = "README.md"
-authors = [
-  { name="Ian Robertson" },
-  { name="Dan Coates" },
-  { name="Faisal Dosani", email="faisal.dosani@capitalone.com" },
-]
+license = { text = "Apache Software License" }
 maintainers = [
-  { name="Faisal Dosani", email="faisal.dosani@capitalone.com" }
+  { name = "Faisal Dosani", email = "faisal.dosani@capitalone.com" },
+  { name = "Jacob Dawang", email = "jacob.dawang@capitalone.com" },
+  { name = "Raymond Haffar", email = "raymond.haffar@capitalone.com" },
 ]
-license = {text = "Apache Software License"}
-dependencies = ["pandas<=2.2.2,>=0.25.0", "numpy<=1.26.4,>=1.22.0", "ordered-set<=4.1.0,>=4.0.2", "fugue<=0.8.7,>=0.8.7"]
-requires-python = ">=3.9.0"
+authors = [
+  { name = "Faisal Dosani", email = "faisal.dosani@capitalone.com" },
+  { name = "Jacob Dawang", email = "jacob.dawang@capitalone.com" },
+  { name = "Raymond Haffar", email = "raymond.haffar@capitalone.com" },
+]
+requires-python = ">=3.10.0"
 classifiers = [
-    "Intended Audience :: Developers",
-    "Natural Language :: English",
-    "Operating System :: OS Independent",
-    "Programming Language :: Python",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
+  "Intended Audience :: Developers",
+  "Natural Language :: English",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
 ]
-
-dynamic = ["version"]
-
-[project.urls]
-Homepage = "https://github.com/capitalone/datacompy"
-Documentation = "https://capitalone.github.io/datacompy/"
-Repository = "https://github.com/capitalone/datacompy.git"
-"Bug Tracker" = "https://github.com/capitalone/datacompy/issues"
-"Source Code" = "https://github.com/capitalone/datacompy"
-
-[build-system]
-requires = ["setuptools>=64.0.0"]
-build-backend = "setuptools.build_meta"
+dynamic = [ "version" ]
+dependencies = [
+  "jinja2>=3",
+  "numpy>=1.26.4,<2.6",
+  "ordered-set>=4.0.2,<=4.1",
+  "pandas>=2.2,<3.1",
+  "polars[pandas]>=0.20.4,<1.44",
+]
+optional-dependencies.build = [ "build", "twine", "wheel" ]
+optional-dependencies.dev = [
+  "datacompy[build]",
+  "datacompy[docs]",
+  "datacompy[qa]",
+  "datacompy[snowflake]",
+  "datacompy[spark]",
+  "datacompy[tests-spark]",
+  "datacompy[tests]",
+]
+optional-dependencies.docs = [ "furo", "myst-parser", "sphinx" ]
+optional-dependencies.edgetest = [ "edgetest", "edgetest-conda" ]
+optional-dependencies.qa = [ "mypy", "pandas-stubs", "pre-commit", "ruff" ]
+optional-dependencies.snowflake = [ "snowflake-snowpark-python>=1.37,<1.55" ]
+optional-dependencies.spark = [
+  "pyspark[connect]>=3.5,!=4,<=4.2; python_version<='3.11'",
+  "pyspark[connect]>=4; python_version>='3.12'",
+]
+optional-dependencies.tests = [
+  "pytest",
+  "pytest-benchmark",
+  "pytest-cov",
+  "pytest-profiling",
+]
+optional-dependencies.tests-spark = [ "pytest-spark" ]
+urls."Bug Tracker" = "https://github.com/capitalone/datacompy/issues"
+urls."Source Code" = "https://github.com/capitalone/datacompy"
+urls.Documentation = "https://capitalone.github.io/datacompy/"
+urls.Homepage = "https://github.com/capitalone/datacompy"
+urls.Repository = "https://github.com/capitalone/datacompy.git"
+scripts.datacompy = "datacompy.cli:main"
 
 [tool.setuptools]
-packages = ["datacompy"]
-zip-safe = false
+packages = [
+  "datacompy",
+  "datacompy.cli",
+  "datacompy.comparator",
+  "datacompy.templates",
+]
 include-package-data = true
+package-data."*" = [ "templates/*.j2", "templates/*.txt" ]
+dynamic.version = { attr = "datacompy.__version__" }
+zip-safe = false
 
-[tool.setuptools.package-data]
-"*" = ["templates/*.txt"]
+[tool.distutils]
+bdist_wheel.python-tag = "py3"
 
-[tool.setuptools.dynamic]
-version = {attr = "datacompy.__version__"}
+[tool.ruff]
+target-version = "py312"
+src = [ "src" ]
+extend-include = [ "*.ipynb" ]
+lint.select = [
+  "B",      # flake8-bugbear
+  # "A", # flake8-builtins
+  "C4",     # flake8-comprehensions
+  "D",      # pydocstyle
+  "E",      # pycodestyle errors
+  "F",      # pyflakes
+  "I",      # isort
+  "LOG",    # flake8-logging
+  "NPY",    # numpy rules
+  "RUF",    # Ruff errors
+  # "ARG", # flake8-unused-arguments
+  "SIM",    # flake8-simplify
+  # "C901", # mccabe complexity
+  # "G", # flake8-logging-format
+  "T20",    # flake8-print
+  "TID252", # flake8-tidy-imports ban relative imports
+  "UP",     # pyupgrade
+  "W",      # pycodestyle warnings
+]
+lint.ignore = [
+  "D206",                    # Docstring indentation. Using formatter instead.
+  "D300",                    # Use triple single quotes. Using formatter instead.
+  "E111",                    # Check indentation level. Using formatter instead.
+  "E114",                    # Check indentation level. Using formatter instead.
+  "E117",                    # Check indentation level. Using formatter instead.
+  "E203",                    # Check whitespace. Using formatter instead.
+  "E501",                    # Line too long. Using formatter instead.
+  "noqa-comments",
+  "RUF067",                  # non-empty-init-module
+  "rule-codes-in-selectors",
+  "SIM105",                  # Use `contextlib.suppress(FileNotFoundError)` instead of `try`-`except`-`pass`
+  "SIM108",                  # Use ternary operator instead of if-else blocks.
+  "UP006",                   # `typing.x` is deprecated, use `x` instead
+  "UP035",                   # `typing.x` is deprecated, use `x` instead
+]
+lint.per-file-ignores."**/{tests,docs}/*" = [ "ARG", "D", "E402", "F841" ]
+lint.per-file-ignores."__init__.py" = [ "E402" ]
+# The CLI writes its report to stdout; `print` is the interface, not a debug statement.
+lint.per-file-ignores."datacompy/cli/output.py" = [ "T20" ]
+lint.flake8-tidy-imports.ban-relative-imports = "all"
+lint.pydocstyle.convention = "numpy"
+lint.preview = true
 
-[tool.distutils.bdist_wheel]
-python-tag = "py3"
-
-[project.optional-dependencies]
-duckdb = ["fugue[duckdb]"]
-polars = ["polars"]
-spark = ["pyspark>=3.1.1; python_version < \"3.11\"", "pyspark>=3.4; python_version >= \"3.11\""]
-dask = ["fugue[dask]"]
-ray = ["fugue[ray]"]
-docs = ["sphinx", "furo", "myst-parser"]
-tests = ["pytest", "pytest-cov"]
-
-tests-spark = ["pytest", "pytest-cov", "pytest-spark", "spark"]
-qa = ["pre-commit", "black", "isort", "mypy", "pandas-stubs"]
-build = ["build", "twine", "wheel"]
-edgetest = ["edgetest", "edgetest-conda"]
-dev = ["datacompy[duckdb]", "datacompy[polars]", "datacompy[spark]", "datacompy[docs]", "datacompy[tests]", "datacompy[tests-spark]", "datacompy[qa]", "datacompy[build]"]
-
-[tool.isort]
-multi_line_output = 3
-include_trailing_comma = true
-force_grid_wrap = 0
-use_parentheses = true
-line_length = 88
-profile = "black"
+[tool.pyproject-fmt]
+column_width = 88
 
 [tool.mypy]
 strict = true
-
-[[tool.mypy.overrides]]
-module = ["fugue.*","triad.*"]
-implicit_reexport = true
-
-[[tool.mypy.overrides]]
-module = "pyarrow"
-ignore_missing_imports = true
+overrides = [
+  { module = "pyarrow", ignore_missing_imports = true },
+]
 
 [edgetest.envs.core]
-python_version = "3.10"
-conda_install = ["openjdk=8"]
-extras = ["dev"]
-command = "pytest tests -m 'not integration'"
+python_version = "3.12"
+conda_install = [ "openjdk=17" ]
+extras = [ "spark, qa, tests, tests-spark" ]
+command = "pytest"
 upgrade = [
-    "pandas",
-    "numpy",
-    "ordered-set",
-    "fugue",
+  "pandas",
+  "numpy",
+  "ordered-set",
+  "polars[pandas]",
+  "pyspark[connect]",
 ]

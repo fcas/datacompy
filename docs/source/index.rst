@@ -9,10 +9,15 @@ Contents
     :maxdepth: 2
 
     Installation <install>
+    Command Line Interface <cli>
+    Comparator Framework Usage <comparator_usage>
     Pandas Usage <pandas_usage>
-    Spark (Pandas on Spark) Usage <spark_usage>
+    Spark Usage <spark_usage>
+    Snowflake Usage <snowflake_usage>
     Polars Usage <polars_usage>
-    Fugue Usage <fugue_usage>
+    Template Guide <template_guide>
+    Report API <report_api>
+    Benchmarks <benchmark>
     Developer Instructions <developer_instructions>
 
 .. toctree::
